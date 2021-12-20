@@ -1,15 +1,82 @@
+using Sandbox.Game.EntityComponents;
 using Sandbox.ModAPI.Ingame;
+using Sandbox.ModAPI.Interfaces;
+using SpaceEngineers.Game.ModAPI.Ingame;
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Linq;
 using System.Text;
-using System.Threading.Tasks;
+using VRage;
+using VRage.Collections;
+using VRage.Game;
+using VRage.Game.Components;
+using VRage.Game.GUI.TextPanel;
+using VRage.Game.ModAPI.Ingame;
+using VRage.Game.ModAPI.Ingame.Utilities;
+using VRage.Game.ObjectBuilders.Definitions;
 using VRageMath;
+using static IngameScript.Program;
 
 namespace IngameScript
 {
     partial class Program : MyGridProgram
     {
+        public static Program ProgramInstance;
+        public static TimerRoutineRunner RoutineRunner;
+        public static TimeSource ProgramTimeSource;
+        public static Random ProgramRandom;
+        public static Mesh MeshNetwork = new Mesh();
+        public static ScriptKinds ProgramScriptKinds = new ScriptKinds();
+        private static bool FirstIteration = true;
+
+
+        public Program()
+        {
+            ProgramInstance = this;
+            ProgramRandom = new Random();
+            ProgramTimeSource = new TimeSource();
+            RoutineRunner = new TimerRoutineRunner();
+            Runtime.UpdateFrequency = UpdateFrequency.Once;
+        }
+
+
+        public class ScriptKinds
+        {
+            internal Dictionary<String, ScriptKind> kinds = new Dictionary<string, ScriptKind>();
+
+            public void Register(ScriptKind kind)
+            {
+                kinds[kind.GetType().Name] = kind;
+            }
+        }
+
+        public interface ScriptKind
+        {
+            IEnumerable<WaitCondition> Start(String arguments);
+        }
+
+        public void Main(string argument, UpdateType updateSource)
+        {
+            if (FirstIteration)
+            {
+                string[] arr = Me.CustomData.Split(":".ToCharArray(), 2);
+                if (arr.Length == 0 || !ProgramScriptKinds.kinds.ContainsKey(arr[0]))
+                {
+                    throw new Exception("specify CustomData of programable block 'cmd:args', where cmd is out of set: " +
+                        String.Join(", ", ProgramScriptKinds.kinds.Keys));
+                }
+
+                ScriptKind kind = ProgramScriptKinds.kinds[arr[0]];
+                string arg = arr.Length >= 2 ? arr[1] : "";
+                RoutineRunner.Start("Main", kind.Start(arg), 0, false);
+                FirstIteration = false;
+            }
+            ProgramTimeSource.Progress();
+            RoutineRunner.Run(argument, updateSource);
+        }
+
         public List<T> GetBlocksOfType<T>(List<T> blocks, Func<T, bool> collect = null) where T : class
         {
             if (blocks == null)
@@ -53,11 +120,15 @@ namespace IngameScript
                 action.Invoke(block);
             }
         }
-        public IMyBroadcastListener RegisterBroadcastListener(IMyBroadcastListener listener, String tag, String callback = null)
+        public IMyBroadcastListener RegisterBroadcastListener(IMyBroadcastListener listener, String tag, String callback = "!!SAME_AS_TAG!!")
         {
             if (listener == null)
             {
                 listener = IGC.RegisterBroadcastListener(tag);
+                if (callback == "!!SAME_AS_TAG!!")
+                {
+                    callback = tag;
+                }
                 if (callback != null)
                 {
                     listener.SetMessageCallback(callback);
@@ -88,14 +159,7 @@ namespace IngameScript
         public class TimerRoutineRunner
         {
             private Dictionary<String, TimerStateMachine> machines = new Dictionary<String, TimerStateMachine>();
-            private Program program;
             private int counter = 0;
-
-
-            public TimerRoutineRunner(Program program)
-            {
-                this.program = program;
-            }
 
             public bool isRunning(String name)
             {
@@ -106,17 +170,62 @@ namespace IngameScript
                 return false;
             }
 
-            public void Start(String name, Func<ExitFlag, IEnumerable<double>> routineFn)
+            public void RefreshUpdateFrequency(bool once)
             {
-                Stop(name);
-                ExitFlag flag = new ExitFlag();
-                TimerStateMachine tsm = new TimerStateMachine(program, routineFn(flag), flag);
-                tsm.Start();
-                machines.Remove(name);
-                machines.Add(name, tsm);
+                UpdateFrequency freq = ProgramInstance.Runtime.UpdateFrequency
+                    & ~(UpdateFrequency.Update1 | UpdateFrequency.Update10 | UpdateFrequency.Update100);
+
+                foreach (var tsm in machines.Values)
+                {
+                    if (tsm.Running)
+                    {
+                        if (tsm.IterationSpeed >= 100)
+                        {
+                            freq |= UpdateFrequency.Update100;
+                        }
+                        else if (tsm.IterationSpeed >= 10)
+                        {
+                            freq |= UpdateFrequency.Update10;
+                        }
+                        else if (tsm.IterationSpeed >= 1)
+                        {
+                            freq |= UpdateFrequency.Update1;
+                        }
+                    }
+                }
+
+                if (once)
+                {
+                    freq |= UpdateFrequency.Once;
+                }
+
+                ProgramInstance.Runtime.UpdateFrequency = freq;
             }
 
-            public bool Toggle(String name, Func<ExitFlag, IEnumerable<double>> routineFn)
+            public void Start(String name, IEnumerable<WaitCondition> routine,
+                int iterationSpeed,
+                bool repeat,
+                bool graceful = true
+                )
+            {
+                if (machines.ContainsKey(name))
+                {
+                    TimerStateMachine tsm = machines[name];
+                    tsm.IterationSpeed = iterationSpeed;
+                    tsm.Repeat = repeat;
+                    tsm.Restart(routine, graceful);
+                }
+                else
+                {
+
+                    TimerStateMachine tsm = new TimerStateMachine(routine, iterationSpeed, repeat);
+                    tsm.Start();
+                    machines.Add(name, tsm);
+                }
+                RefreshUpdateFrequency(true);
+            }
+
+            public bool Toggle(String name, IEnumerable<WaitCondition> routine, int iterationSpeed, bool repeat)
             {
                 if (isRunning(name))
                 {
@@ -125,19 +234,19 @@ namespace IngameScript
                 }
                 else
                 {
-                    ExitFlag flag = new ExitFlag();
-                    TimerStateMachine tsm = new TimerStateMachine(program, routineFn(flag), flag);
+                    TimerStateMachine tsm = new TimerStateMachine(routine, iterationSpeed, repeat);
                     tsm.Start();
                     machines.Remove(name);
                     machines.Add(name, tsm);
+                    RefreshUpdateFrequency(true);
                     return false;
                 }
             }
 
-            public String Start(Func<ExitFlag, IEnumerable<double>> routineFn)
+            public String Start(IEnumerable<WaitCondition> routine, int iterationSpeed, bool repeat)
             {
                 String id = "###id" + (counter++).ToString();
-                Start(id, routineFn);
+                Start(id, routine, iterationSpeed, repeat);
                 return id;
             }
 
@@ -153,13 +262,18 @@ namespace IngameScript
                 }
             }
 
-            public void Run()
+            public void Run(string argument, UpdateType updateSource)
             {
                 List<String> toRemove = new List<String>();
-                foreach (var key in machines.Keys)
+                List<String> keys = new List<string>(machines.Keys);
+                foreach (var key in keys)
                 {
                     TimerStateMachine m = machines[key];
-                    m.Run();
+                    ProgramInstance.Echo(m.GetStatus());
+                    if (m.ShouldRun(updateSource))
+                    {
+                        m.Run(argument, updateSource);
+                    }
                     if (!m.Running)
                     {
                         toRemove.Add(key);
@@ -169,129 +283,524 @@ namespace IngameScript
                 {
                     machines.Remove(key);
                 }
-            }
-        }
-
-        /// <summary>
-        /// Quick usage:
-        /// <para>1. A persistent instance for each sequence you want to run in parallel.</para>
-        /// <para>2. Create instance(s) in Program() and execute <see cref="Run"/> in Main().</para>
-        /// </summary>
-        public class TimerStateMachine
-        {
-            public readonly Program Program;
-
-            /// <summary>
-            /// Wether the timer starts automatically at initialization and auto-restarts it's done iterating.
-            /// </summary>
-            public bool AutoStart { get; set; }
-
-            /// <summary>
-            /// Returns true if a sequence is actively being cycled through.
-            /// False if it ended or no sequence is assigned anymore.
-            /// </summary>
-            public bool Running { get; private set; }
-
-            /// <summary>
-            /// Setting this will change what sequence will be used when it's (re)started.
-            /// </summary>
-            public IEnumerable<double> Sequence;
-
-            /// <summary>
-            /// Time left until the next part is called.
-            /// </summary>
-            public double SequenceTimer { get; private set; }
-
-            public ExitFlag ExitFlag { get; private set; }
-
-            private IEnumerator<double> sequenceSM;
-
-            public TimerStateMachine(Program program, IEnumerable<double> sequence = null, ExitFlag flag = null, bool autoStart = false)
-            {
-                Program = program;
-                Sequence = sequence;
-                AutoStart = autoStart;
-                ExitFlag = flag;
-
-                if (AutoStart)
+                if (toRemove.Count > 0)
                 {
-                    Start();
+                    RefreshUpdateFrequency(false);
                 }
             }
 
-            /// <summary>
-            /// (Re)Starts sequence, even if already running.
-            /// Don't forget <see cref="IMyGridProgramRuntimeInfo.UpdateFrequency"/>.
-            /// </summary>
+        }
+
+        public class WaitCondition
+        {
+            public bool exitOnce;
+            public bool exitRepeat;
+            public double delay = Double.MaxValue;
+            public HashSet<string> messageTags = new HashSet<string>();
+            public HashSet<string> commands = new HashSet<string>();
+            public bool yieldTick;
+            public bool yieldTickIfLimit;
+            public Action<ExitFlag> exitFlagProvider = null;
+
+            private double timePassed;
+            private bool tickYielded;
+            private HashSet<string> triggeredMessageTags = new HashSet<string>();
+            private HashSet<string> triggeredCommands = new HashSet<string>();
+            private double lastTick = 0.0;
+            private string status;
+
+            private Dictionary<String, IMyBroadcastListener> broadcastListeners = new Dictionary<string, IMyBroadcastListener>();
+
+            internal void Enter(ExitFlag exitFlag)
+            {
+                lastTick = ProgramTimeSource.Time;
+
+                timePassed = 0;
+                tickYielded = false;
+                triggeredMessageTags.Clear();
+                triggeredCommands.Clear();
+
+                foreach (var tag in messageTags)
+                {
+                    if (!broadcastListeners.ContainsKey(tag))
+                    {
+                        broadcastListeners[tag] = ProgramInstance.RegisterBroadcastListener(null, tag);
+                    }
+
+                    if (broadcastListeners[tag].HasPendingMessage)
+                    {
+                        triggeredMessageTags.Add(tag);
+                    }
+                }
+
+                if (exitFlagProvider != null)
+                {
+                    exitFlagProvider.Invoke(exitFlag);
+                }
+            }
+
+            internal void Progress(string argument, UpdateType updateSource)
+            {
+                double now = ProgramTimeSource.Time;
+                if (lastTick > kEpsilon)
+                {
+                    timePassed += (now - lastTick);
+                }
+                lastTick = now;
+
+                if (updateSource.HasFlag(UpdateType.IGC))
+                {
+                    triggeredMessageTags.Add(argument);
+                }
+
+                if (
+                    updateSource.HasFlag(UpdateType.Terminal) ||
+                    updateSource.HasFlag(UpdateType.Script) ||
+                    updateSource.HasFlag(UpdateType.Trigger))
+                {
+                    triggeredCommands.Add(argument);
+                }
+
+                tickYielded = true;
+            }
+
+            internal bool HasPendingMessages()
+            {
+                foreach (var tag in messageTags)
+                {
+                    if (triggeredMessageTags.Contains(tag))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            internal bool HasPendingCommands()
+            {
+                foreach (var tag in commands)
+                {
+                    if (triggeredCommands.Contains(tag))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            internal bool ShouldInterrupt()
+            {
+                if (yieldTick && tickYielded)
+                {
+                    return true;
+                }
+
+                if (timePassed >= delay)
+                {
+                    return true;
+                }
+
+                if (HasPendingMessages())
+                {
+                    return true;
+                }
+
+                if (HasPendingCommands())
+                {
+                    return true;
+                }
+
+                return false;
+            }
+
+            public string GetStatus()
+            {
+                return status;
+            }
+
+            public WaitCondition WithDelay(double value)
+            {
+                delay = value;
+                return this;
+            }
+
+            public WaitCondition WithYieldTick()
+            {
+                yieldTick = true;
+                return this;
+            }
+
+            public WaitCondition WithYieldTickIfLimit()
+            {
+                yieldTickIfLimit = true;
+                return this;
+            }
+
+            public WaitCondition WithExitOnce()
+            {
+                exitOnce = true;
+                return this;
+            }
+
+            public WaitCondition WithExitRepeat(double value)
+            {
+                exitRepeat = true;
+                return this;
+            }
+
+            public WaitCondition WithMessagesReceived(params string[] tags)
+            {
+                messageTags.UnionWith(tags.ToList());
+                return this;
+            }
+
+            public WaitCondition WithCommandsReceived(params string[] cmds)
+            {
+                commands.UnionWith(cmds.ToList());
+                return this;
+            }
+
+
+            public WaitCondition WithExitFlagProvider(Action<ExitFlag> provider)
+            {
+                exitFlagProvider = provider;
+                return this;
+            }
+
+            public WaitCondition WithStatus(string status)
+            {
+                this.status = status;
+                return this;
+            }
+
+            public bool IsMessageTriggered(string tag)
+            {
+                return triggeredMessageTags.Contains(tag);
+            }
+
+            public IEnumerable<MyIGCMessage> GetMessages(String tag)
+            {
+                if (broadcastListeners.ContainsKey(tag))
+                {
+                    IMyBroadcastListener listener = broadcastListeners[tag];
+                    while (listener.HasPendingMessage)
+                    {
+                        yield return listener.AcceptMessage();
+                    }
+                }
+            }
+
+
+            public bool IsCommandTriggered(string cmd)
+            {
+                return triggeredCommands.Contains(cmd);
+            }
+
+
+
+            public override String ToString()
+            {
+                List<String> waitConditions = new List<string>();
+                List<String> triggers = new List<string>();
+
+                if (exitOnce)
+                {
+                    waitConditions.Add("eo");
+                }
+
+                if (exitRepeat)
+                {
+                    waitConditions.Add("er");
+                }
+
+                if (yieldTick)
+                {
+                    waitConditions.Add("yt");
+                }
+
+                if (yieldTickIfLimit)
+                {
+                    waitConditions.Add("ytil");
+                }
+
+                if (delay != double.MaxValue)
+                {
+                    waitConditions.Add(String.Format("d={0:F1}", delay));
+                }
+
+                if (commands.Count > 0)
+                {
+                    waitConditions.Add("c=<" + String.Join("|", commands) + ">");
+                }
+
+                if (messageTags.Count > 0)
+                {
+                    waitConditions.Add("m=<" + String.Join("|", messageTags) + ">");
+                }
+
+                if (timePassed > 0)
+                {
+                    triggers.Add("tp=" + timePassed);
+                }
+
+                if (tickYielded)
+                {
+                    triggers.Add("ty");
+                }
+
+                if (triggeredCommands.Count > 0)
+                {
+                    triggers.Add("c=<" + String.Join("|", triggeredCommands) + ">");
+                }
+
+                if (triggeredMessageTags.Count > 0)
+                {
+                    triggers.Add("m=<" + String.Join("|", triggeredMessageTags) + ">");
+                }
+
+
+                return "WaitFor(" + String.Join(",", waitConditions) + ";" + String.Join(",", triggers) + ")";
+            }
+        }
+
+        public static WaitCondition Delay(double value)
+        {
+            return new WaitCondition
+            {
+                delay = value
+            };
+        }
+
+        public static WaitCondition YieldTick()
+        {
+            return new WaitCondition
+            {
+                yieldTick = true
+            };
+        }
+
+        public static WaitCondition YieldTickIfLimit()
+        {
+            return new WaitCondition
+            {
+                yieldTickIfLimit = true
+            };
+        }
+
+        public static WaitCondition ExitOnce()
+        {
+            return new WaitCondition
+            {
+                exitOnce = true
+            };
+        }
+
+        public static WaitCondition ExitRepeat(double value)
+        {
+            return new WaitCondition
+            {
+                exitRepeat = true
+            };
+        }
+
+        public static WaitCondition MessagesReceived(params string[] tags)
+        {
+            return new WaitCondition
+            {
+                messageTags = new HashSet<string>(tags.ToList())
+            };
+        }
+
+        public static WaitCondition CommandsReceived(params string[] cmds)
+        {
+            return new WaitCondition
+            {
+                commands = new HashSet<string>(cmds.ToList())
+            };
+        }
+
+        public class TimerStateMachine
+        {
+            public bool Repeat { get; set; }
+            public bool Running { get; private set; }
+
+            public ExitFlag ExitFlag;
+            public IEnumerable<WaitCondition> Sequence;
+            public IEnumerable<WaitCondition> NextSequence;
+
+            public WaitCondition CurrentWaitCondition { get; private set; }
+
+            private IEnumerator<WaitCondition> sequenceSM;
+            public int IterationSpeed { get; set; }
+
+            public static char[] PROGRESS = "-\\|/".ToCharArray();
+
+            public bool hasProgress;
+            private long activations = 0;
+
+            public TimerStateMachine(
+                IEnumerable<WaitCondition> sequence = null,
+                int iterationSpeed = 10,
+                bool autoStart = false
+            )
+            {
+                Sequence = sequence;
+                Repeat = autoStart;
+                ExitFlag = new ExitFlag();
+                this.IterationSpeed = iterationSpeed;
+            }
+
             public void Start()
             {
                 SetSequenceSM(Sequence);
             }
 
-            public void Stop()
+            public void Restart(IEnumerable<WaitCondition> next, bool graceful)
             {
-                if (ExitFlag != null)
+                if (sequenceSM == null || !graceful)
                 {
-                    ExitFlag.ShouldExit = true;
+                    Sequence = next;
+                    SetSequenceSM(Sequence);
                 }
                 else
                 {
-                    SetSequenceSM(null);
+                    ExitFlag.ShouldExit = true;
+                    NextSequence = next;
                 }
             }
 
-            /// <summary>
-            /// <para>Call this in your <see cref="Rocket.Main(string, UpdateType)"/> and have a reasonable update frequency, usually Update10 is good for small delays, Update100 for 2s or more delays.</para>
-            /// <para>Checks if enough time passed and executes the next chunk in the sequence.</para>
-            /// <para>Does nothing if no sequence is assigned or it's ended.</para>
-            /// </summary>
-            public void Run()
+            public void Stop()
+            {
+                ExitFlag.ShouldExit = true;
+                NextSequence = null;
+            }
+
+            public void Run(string argument, UpdateType updateSource)
             {
                 if (sequenceSM == null)
+                {
                     return;
+                }
 
-                SequenceTimer -= Program.Runtime.TimeSinceLastRun.TotalSeconds;
+                CurrentWaitCondition.Progress(argument, updateSource);
 
-                if (SequenceTimer > 0)
-                    return;
 
-                bool hasValue;
                 while (true)
                 {
-                    hasValue = sequenceSM.MoveNext();
-
-                    if (hasValue)
+                    if (!CurrentWaitCondition.ShouldInterrupt())
                     {
-                        SequenceTimer = sequenceSM.Current;
+                        return;
+                    }
 
-                        if (SequenceTimer <= kEpsilon)
+                    bool doneSeq;
+                    while (true)
+                    {
+                        hasProgress = true;
+                        doneSeq = !sequenceSM.MoveNext();
+
+                        if (!doneSeq)
                         {
-                            if (Program.Runtime.CurrentInstructionCount < Program.Runtime.MaxInstructionCount * 0.8)
+                            CurrentWaitCondition = sequenceSM.Current;
+
+                            CurrentWaitCondition.Enter(ExitFlag);
+
+                            if (CurrentWaitCondition.exitOnce)
+                            {
+                                doneSeq = true;
+                                break;
+                            }
+                            else if (CurrentWaitCondition.exitRepeat)
+                            {
+                                doneSeq = true;
+                                NextSequence = null;
+                                ExitFlag.ShouldExit = true;
+                                break;
+                            }
+                            else if (CurrentWaitCondition.yieldTick)
+                            {
+                                break;
+                            }
+
+                            if (CurrentWaitCondition.yieldTickIfLimit)
+                            {
+                                if (ProgramInstance.Runtime.CurrentInstructionCount < ProgramInstance.Runtime.MaxInstructionCount * 0.8)
+                                {
+                                    continue;
+                                }
+                            }
+
+                            if (CurrentWaitCondition.HasPendingMessages())
                             {
                                 continue;
                             }
-                        } 
-                        else if (SequenceTimer <= -0.5)
+
+                            if (CurrentWaitCondition.HasPendingCommands())
+                            {
+                                continue;
+                            }
+
+                            if (CurrentWaitCondition.delay <= kEpsilon)
+                            {
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+
+
+                    if (doneSeq)
+                    {
+                        if (Repeat && !ExitFlag.ShouldExit)
                         {
-                            hasValue = false;
+                            if (NextSequence != null)
+                            {
+                                Sequence = NextSequence;
+                                ExitFlag.ShouldExit = false;
+                            }
+                            SetSequenceSM(Sequence);
+                            continue;
+                        }
+                        else
+                        {
+                            if (NextSequence != null)
+                            {
+                                Sequence = NextSequence;
+                                SetSequenceSM(Sequence);
+                                ExitFlag.ShouldExit = false;
+                                continue;
+                            }
+                            SetSequenceSM(null);
                         }
                     }
                     break;
                 }
-
-                if (!hasValue)
-                {
-                    if (AutoStart)
-                        SetSequenceSM(Sequence);
-                    else
-                        SetSequenceSM(null);
-                }
             }
 
-            private void SetSequenceSM(IEnumerable<double> seq)
+            public String GetStatus()
+            {
+                string status = CurrentWaitCondition.GetStatus();
+                if (status == null)
+                {
+                    status = CurrentWaitCondition.ToString();
+                }
+
+                if (hasProgress)
+                {
+                    activations++;
+                    hasProgress = false;
+                }
+                return PROGRESS[activations % PROGRESS.Length] + status;
+            }
+
+            private void SetSequenceSM(IEnumerable<WaitCondition> seq)
             {
                 Running = false;
-                SequenceTimer = 0;
+                CurrentWaitCondition = new WaitCondition
+                {
+                    delay = 0
+                };
 
                 sequenceSM?.Dispose();
                 sequenceSM = null;
@@ -301,6 +810,48 @@ namespace IngameScript
                     Running = true;
                     sequenceSM = seq.GetEnumerator();
                 }
+            }
+
+            internal bool ShouldRun(UpdateType updateSource)
+            { 
+                if (updateSource.HasFlag(UpdateType.Terminal))
+                {
+                    return true;
+                }
+                if (updateSource.HasFlag(UpdateType.IGC))
+                {
+                    return true;
+                }
+                if (updateSource.HasFlag(UpdateType.Mod))
+                {
+                    return true;
+                }
+                if (updateSource.HasFlag(UpdateType.Once))
+                {
+                    return true;
+                }
+                if (updateSource.HasFlag(UpdateType.Script))
+                {
+                    return true;
+                }
+                if (updateSource.HasFlag(UpdateType.Trigger))
+                {
+                    return true;
+                }
+                if (updateSource.HasFlag(UpdateType.Update100))
+                {
+                    return IterationSpeed >= 100;
+                }
+                if (updateSource.HasFlag(UpdateType.Update10))
+                {
+                    return IterationSpeed >= 10;
+                }
+                if (updateSource.HasFlag(UpdateType.Update1))
+                {
+                    return IterationSpeed >= 1;
+                }
+
+                return false;
             }
         }
 
@@ -356,55 +907,53 @@ namespace IngameScript
             gyro.Yaw = (float)angles.Z;
         }
 
-        class TimeSource
+        public class TimeSource
         {
             public double Time { get; set; } = 0;
 
-            public void Progress(IMyGridProgramRuntimeInfo info)
+            public void Progress()
             {
-                Time += info.TimeSinceLastRun.TotalMilliseconds;
+                Time += ProgramInstance.Runtime.TimeSinceLastRun.TotalMilliseconds;
             }
         }
 
-        class MissileGuidance
+        public class MissileGuidance
         {
             public double Gain = 3;
-            public double DampnersGain = 0.8;
-            double PNGain = 3;
+            public double DampnersGain = 2;
+            public double PNGain = 3;
+            public double MaxThrust = 1.0;
 
-            double TimeSaved;
+            private double TimeSaved;
 
-            public IMyTextPanel TextPanel { get; }
+            public IMyTextSurface TextPanel { get; }
 
-            double YawSaved;
-            double PitchSaved;
-            double MissileAccel = 10;
+            private double YawSaved;
+            private double PitchSaved;
+            private double MissileAccel = 10;
 
-            Vector3D previousPosition;
-            Vector3D previousTargetPosition;
+            private Vector3D previousPosition;
+            private Vector3D previousTargetPosition;
 
-            public List<IMyThrust> ForwardThrusters;
-            public List<IMyGyro> Gyros;
-            public TimeSource TimeSource;
-            public IMyRemoteControl RemoteControl;
+            private List<IMyThrust> ForwardThrusters;
+            private List<IMyGyro> Gyros;
+            private IMyShipController Controller;
 
             public MissileGuidance(
                 List<IMyThrust> forwardThrusters,
                 List<IMyGyro> gyros,
-                IMyRemoteControl rc,
-                TimeSource timeSource,
-                IMyTextPanel textPanel
+                IMyShipController controller,
+                IMyTextSurface textPanel
                 )
             {
                 this.ForwardThrusters = forwardThrusters;
                 this.Gyros = gyros;
-                this.RemoteControl = rc;
-                this.TimeSource = timeSource;
-                this.TimeSaved = timeSource.Time;
+                this.Controller = controller;
+                this.TimeSaved = ProgramTimeSource.Time;
                 this.TextPanel = textPanel;
             }
 
-            public void RefreshMass(List<IMyTerminalBlock> blocks)
+            public void RefreshMass(List<IMyCubeBlock> blocks)
             {
                 double missileMass = 0;
                 double missileThrust = 0;
@@ -423,8 +972,8 @@ namespace IngameScript
                 }
 
                 double TimePrev = TimeSaved;
-                double TickMs = Math.Max(TimeSource.Time - TimePrev, 0.018);
-                TimeSaved = TimeSource.Time;
+                double TickMs = Math.Max(ProgramTimeSource.Time - TimePrev, 0.018);
+                TimeSaved = ProgramTimeSource.Time;
 
                 Vector3D MissilePosition = Gyros[0].CubeGrid.WorldVolume.Center;
                 Vector3D MissilePositionPrev = previousPosition;
@@ -467,7 +1016,7 @@ namespace IngameScript
                 double Vclosing = (TargetVelocity - MissileVelocity).Length();
 
                 //If Under Gravity Use Gravitational Accel
-                Vector3D GravityComp = -RemoteControl.GetNaturalGravity();
+                Vector3D GravityComp = -Controller.GetNaturalGravity();
 
                 //Calculate the final lateral acceleration
                 Vector3D LateralDirection = Rel_Vel.Length() < kEpsilon ? LOS_New : Vector3D.Normalize(Vector3D.Cross(Vector3D.Cross(Rel_Vel, LOS_New), Rel_Vel));
@@ -487,7 +1036,7 @@ namespace IngameScript
                     ThrustPower = 0;
                 }
 
-                ThrustPower = MathHelper.Clamp(ThrustPower, 0.4, 1); //for improved thrust performance on the get-go
+                ThrustPower = Math.Min(MaxThrust, MathHelper.Clamp(ThrustPower, 0.4, 1)); //for improved thrust performance on the get-go
                 foreach (IMyThrust thruster in ForwardThrusters)
                 {
                     if (thruster.ThrustOverride != (thruster.MaxThrust * ThrustPower)) //12 increment inequality to help conserve on performance
@@ -542,9 +1091,22 @@ namespace IngameScript
                 //Applies To Scenario
                 foreach (IMyGyro gyro in Gyros)
                 {
+                    gyro.GyroOverride = true;
                     gyro.Pitch = (float)MathHelper.Clamp((-TRANS_VECT.X) * Gain, -1000, 1000);
                     gyro.Yaw = (float)MathHelper.Clamp(((-TRANS_VECT.Y)) * Gain, -1000, 1000);
                     gyro.Roll = (float)MathHelper.Clamp(((-TRANS_VECT.Z)) * Gain, -1000, 1000);
+                }
+            }
+
+            public void CancelOverride()
+            {
+                foreach (IMyThrust thrust in ForwardThrusters)
+                {
+                    thrust.ThrustOverride = 0;
+                }
+                foreach (IMyGyro gyro in Gyros)
+                {
+                    gyro.GyroOverride = false;
                 }
             }
         }
@@ -1172,48 +1734,51 @@ namespace IngameScript
         public class CubeViewer
         {
             private static int[][] cubeSides = new int[][] {
-           SEFix.arr(
-            1, 1,-1,
-            1, 1, 1,
-           -1, 1, 1,
-           -1, 1,-1
-        ), SEFix.arr(
-           -1, 1,-1,
-           -1, 1, 1,
-           -1,-1, 1,
-           -1,-1,-1
-        ), SEFix.arr(
-            1,-1, 1,
-            1,-1,-1,
-           -1,-1,-1,
-           -1,-1, 1
-        ), SEFix.arr(
-            1,-1, 1,
-            1, 1, 1,
-            1, 1,-1,
-            1,-1,-1
-        ),
-        SEFix.arr(
-            1,-1, 1,
-            1, 1, 1,
-           -1, 1, 1,
-           -1,-1, 1
-        ),
-        SEFix.arr(
-            1,-1,-1,
-            1, 1,-1,
-           -1, 1,-1,
-           -1,-1,-1
-        )
-    };
+                   SEFix.arr(
+                    1, 1,-1,
+                    1, 1, 1,
+                   -1, 1, 1,
+                   -1, 1,-1
+                ), SEFix.arr(
+                   -1, 1,-1,
+                   -1, 1, 1,
+                   -1,-1, 1,
+                   -1,-1,-1
+                ), SEFix.arr(
+                    1,-1, 1,
+                    1,-1,-1,
+                   -1,-1,-1,
+                   -1,-1, 1
+                ), SEFix.arr(
+                    1,-1, 1,
+                    1, 1, 1,
+                    1, 1,-1,
+                    1,-1,-1
+                ),
+                SEFix.arr(
+                    1,-1, 1,
+                    1, 1, 1,
+                   -1, 1, 1,
+                   -1,-1, 1
+                ),
+                SEFix.arr(
+                    1,-1,-1,
+                    1, 1,-1,
+                   -1, 1,-1,
+                   -1,-1,-1
+                )
+            };
             private static int[][] colors = new int[][] {
-        SEFix.arr(60,60,60),
-        SEFix.arr(150,150,150),
-        SEFix.arr(190,190,190),
-        SEFix.arr(150,150,150),
-        SEFix.arr(40,40,40),
-        SEFix.arr(255,255,255)
-    };
+                SEFix.arr(60,60,60),
+                SEFix.arr(150,150,150),
+                SEFix.arr(190,190,190),
+                SEFix.arr(150,150,150),
+                SEFix.arr(40,40,40),
+                SEFix.arr(255,255,255)
+            };
+
+            int[][] allPolys;
+            long yieldSkipper = 0;
             private int scale;
             private double angle1_ = 0;
             private double angle2_;
@@ -1276,26 +1841,50 @@ namespace IngameScript
                     }
                 }
             }
-            public IEnumerable<double> draw(bool vectorMode, int x, int y, int[][] blocks, double inc, int s, Graphics g)
+
+            class Comparer : IComparer<int[]>
+            {
+                public int Compare(int[] x, int[] y)
+                {
+                    return x[8].CompareTo(y[8]);
+                }
+            }
+
+            public IEnumerable<WaitCondition> Draw(bool vectorMode, int x, int y, int[][] blocks, int n, double inc, int s, Graphics g)
             {
                 scale = s;
-                angle1 += inc;
+                angle1 = inc;
                 pickSides();
-                int[][] allPolys = new int[blocks.Length * 3][];
-                for (int b = 0; b < blocks.Length; b++)
+                int polysSz = n * 3;
+                while (allPolys == null || allPolys.Length < polysSz)
                 {
-                    allPolys[b * 3] = new int[10]; allPolys[b * 3 + 1] = new int[10]; allPolys[b * 3 + 2] = new int[10];
-                    cube3d(blocks[b][0], blocks[b][1], blocks[b][2], new int[][] { allPolys[b * 3], allPolys[b * 3 + 1], allPolys[b * 3 + 2] });
-                    yield return 0;
+                    int newSz = allPolys == null ? 128 : allPolys.Length * 2;
+                    allPolys = new int[newSz][];
                 }
-                yield return 0.01;
-                Array.Sort(allPolys, delegate (int[] a, int[] b)
+                for (int b = 0; b < n; b++)
                 {
-                    return a[8].CompareTo(b[8]);
-                });
-                for (int i = 0; i < allPolys.Length; i++)
+                    allPolys[b * 3] = new int[10];
+                    allPolys[b * 3 + 1] = new int[10];
+                    allPolys[b * 3 + 2] = new int[10];
+                    cube3d(blocks[b][0], blocks[b][1], blocks[b][2], new int[][] { allPolys[b * 3], allPolys[b * 3 + 1], allPolys[b * 3 + 2] });
+                    if (yieldSkipper++ == 10)
+                    {
+                        yieldSkipper = 0;
+                        yield return YieldTickIfLimit();
+                    }
+                }
+
+                yield return YieldTick();
+                Array.Sort(allPolys, 0, polysSz, new Comparer());
+
+                for (int i = 0; i < polysSz; i++)
                 {
-                    yield return 0;
+
+                    if (yieldSkipper++ == 10)
+                    {
+                        yieldSkipper = 0;
+                        yield return YieldTickIfLimit();
+                    }
                     if (!vectorMode)
                     {
                         g.setFG(colors[allPolys[i][9]][0], colors[allPolys[i][9]][1], colors[allPolys[i][9]][2]);
@@ -1318,6 +1907,660 @@ namespace IngameScript
                     }
                 }
             }
+
+            private static void swap(int[][] a, int i, int j)
+            {
+                int[] temp = a[i];
+                a[i] = a[j];
+                a[j] = temp;
+            }
+        }
+
+
+        public abstract class Serializable
+        {
+            protected Dictionary<String, Field> fields = new Dictionary<String, Field>();
+            public abstract void SaveToFields();
+
+            public abstract void LoadFields(Dictionary<String, Field> fields);
+
+            public string Serialize()
+            {
+                SaveToFields();
+                return Field.DicToString(fields);
+            }
+            public Dictionary<String, Field> GetFields()
+            {
+                SaveToFields();
+                return fields;
+            }
+        }
+
+        public class Field
+        {
+            private Byte[] value;
+            public Dictionary<string, Field> children = new Dictionary<string, Field>();
+
+            public Field(Byte[] value)
+            {
+                this.value = value;
+            }
+
+            public Field(Serializable sObject)
+            {
+                if (sObject == null)
+                {
+                    children["__null"] = new Field(true);
+                }
+                else
+                {
+                    sObject.SaveToFields();
+                    children = sObject.GetFields();
+                }
+            }
+
+            public Field(Vector3 value)
+            {
+                children["x"] = new Field(value.X);
+                children["y"] = new Field(value.Y);
+                children["z"] = new Field(value.Z);
+            }
+
+            public Field(float value)
+            {
+                this.value = BitConverter.GetBytes(value);
+            }
+
+            public Field(double value)
+            {
+                this.value = BitConverter.GetBytes(value);
+            }
+
+            public Field(int value)
+            {
+                this.value = BitConverter.GetBytes(value);
+            }
+
+            public Field(long value)
+            {
+                this.value = BitConverter.GetBytes(value);
+            }
+
+            public Field(bool value)
+            {
+                this.value = BitConverter.GetBytes(value);
+            }
+
+            public Field(string value)
+            {
+                if (value == null)
+                {
+                    children["__null"] = new Field(true);
+                }
+                else
+                {
+                    this.value = Encoding.ASCII.GetBytes(value);
+                }
+            }
+
+            public Field(Dictionary<string, Field> children)
+            {
+                this.children = children;
+            }
+
+            public Field(List<Field> lst)
+            {
+                Dictionary<string, Field> dict = new Dictionary<string, Field>();
+                dict.Add("_count", new Field(lst.Count));
+                for (int i = 0; i < lst.Count; i++)
+                {
+                    dict.Add(i.ToString(), lst[i]);
+                }
+                this.children = dict;
+            }
+
+            public Field(List<string> lst)
+            {
+                Dictionary<string, Field> dict = new Dictionary<string, Field>();
+                dict.Add("_count", new Field(lst.Count));
+                for (int i = 0; i < lst.Count; i++)
+                {
+                    dict.Add(i.ToString(), new Field(lst[i]));
+                }
+                this.children = dict;
+            }
+
+            public Field(List<long> lst)
+            {
+                Dictionary<string, Field> dict = new Dictionary<string, Field>();
+                dict.Add("_count", new Field(lst.Count));
+                for (int i = 0; i < lst.Count; i++)
+                {
+                    dict.Add(i.ToString(), new Field(lst[i]));
+                }
+                this.children = dict;
+            }
+
+            private List<T> fetchList<T>(Func<Field, T> convert)
+            {
+                List<T> result = new List<T>();
+
+                int count = children["_count"].GetInt();
+
+                for (int i = 0; i < count; i++)
+                {
+                    result.Add(convert.Invoke(children[i.ToString()]));
+                }
+
+
+                return result;
+            }
+
+            public List<T> GetList<T>() where T : Serializable, new()
+            {
+                return fetchList(f => f.GetObject<T>());
+
+            }
+
+            public List<string> GetStringList()
+            {
+                return fetchList(f => f.GetString());
+            }
+
+            public List<long> GetLongList()
+            {
+                return fetchList(f => f.GetLong());
+            }
+
+            public List<int> GetIntList()
+            {
+                return fetchList(f => f.GetInt());
+            }
+
+            public Vector3 GetVector3()
+            {
+                Vector3 vector = new Vector3();
+                vector.X = children["x"].GetFloat();
+                vector.Y = children["y"].GetFloat();
+                vector.Z = children["z"].GetFloat();
+                return vector;
+            }
+            public float GetFloat()
+            {
+                return BitConverter.ToSingle(value, 0);
+            }
+
+            public double GetDouble()
+            {
+                return BitConverter.ToDouble(value, 0);
+            }
+
+            public int GetInt()
+            {
+                return BitConverter.ToInt32(value, 0);
+            }
+
+            public long GetLong()
+            {
+                return BitConverter.ToInt64(value, 0);
+            }
+
+            public bool GetBool()
+            {
+                return BitConverter.ToBoolean(value, 0);
+            }
+
+            public string GetString()
+            {
+                if (children.ContainsKey("__null"))
+                {
+                    return null;
+                }
+                else
+                {
+                    return ASCIIEncoding.ASCII.GetString(value);
+                }
+            }
+
+            public T GetObject<T>() where T : Serializable, new()
+            {
+                if (children.ContainsKey("__null"))
+                {
+                    return null;
+                }
+                else
+                {
+                    T obj = new T();
+                    obj.LoadFields(children);
+                    return obj;
+                }
+            }
+
+
+            public Byte[] GetBytes()
+            {
+                return value;
+            }
+
+
+            public static string DicToString(Dictionary<string, Field> fields)
+            {
+                string result = "";
+                foreach (KeyValuePair<string, Field> child in fields)
+                {
+                    result += child.Key + ":" + child.Value.ToString();
+                };
+                return result;
+            }
+
+            private static string BytesToString(byte[] ba)
+            {
+                string hex = BitConverter.ToString(ba);
+                return hex.Replace("-", "");
+            }
+
+            public override string ToString()
+            {
+                string result = "{";
+                if (value != null)
+                {
+                    result += BytesToString(value);
+                }
+                else
+                {
+                    result += DicToString(children);
+                }
+                result += "}";
+                return result;
+            }
+        }
+
+
+        class Serializer
+        {
+            private static int closingBracket(string s)
+            {
+                int nextOpening = s.IndexOf('{');
+                int nextClosing = s.IndexOf('}');
+                while (nextOpening != -1 && nextOpening < nextClosing)
+                {
+                    nextOpening = s.IndexOf('{', nextOpening + 1);
+                    nextClosing = s.IndexOf('}', nextClosing + 1);
+                }
+                return nextClosing;
+            }
+
+
+            private static Byte[] StringToBytes(string byteString)
+            {
+                int NumberChars = byteString.Length;
+                byte[] bytes = new byte[NumberChars / 2];
+                for (int i = 0; i < NumberChars; i += 2)
+                {
+                    bytes[i / 2] = Convert.ToByte(byteString.Substring(i, 2), 16);
+                }
+                return bytes;
+            }
+
+            public static Field parseField(string field)
+            {
+                string value = "";
+                if (field.IndexOf(':') != -1)
+                {
+                    return new Field(StringToFields(field));
+                }
+                for (int i = 0; i < field.Length; i++)
+                {
+                    value += field[i];
+                }
+                return new Field(StringToBytes(value));
+            }
+
+            private static Dictionary<String, Field> StringToFields(string fields)
+            {
+                Dictionary<String, Field> result = new Dictionary<String, Field>();
+                string fieldName = "";
+                for (int i = 0; i < fields.Length; i++)
+                {
+                    if (fields[i] == '}')
+                    {
+                        return result;
+                    }
+                    else if (fields[i] == ':' && fields[i + 1] == '{')
+                    {
+                        string subField = fields.Substring(i + 2);
+                        int subEnd = closingBracket(subField);
+                        subField = subField.Substring(0, subEnd);
+                        result.Add(fieldName, parseField(subField));
+                        i += 2 + subEnd;
+                        fieldName = "";
+                    }
+                    else
+                    {
+                        fieldName += fields[i];
+                    }
+                }
+                return result;
+            }
+
+            public static T DeSerialize<T>(string obj) where T : Serializable, new()
+            {
+                T result = new T();
+                Dictionary<String, Field> fieldsFromString = StringToFields(obj);
+                result.LoadFields(fieldsFromString);
+                return result;
+            }
+        }
+
+
+        public partial class Mesh
+        {
+
+            public static long DOWN_TIMEOUT = 2000;
+            public static long REMOVE_TIMEOUT = 3000;
+            private static string PINGS_TAG = "%mesh:pings";
+
+
+            public class Participant : Serializable
+            {
+                public long source;
+                public String gridName;
+                public long sequence;
+                public List<string> supportedCalls;
+                public double localTimestamp = ProgramTimeSource.Time;
+                public bool aliveStatus;
+
+                public override void LoadFields(Dictionary<string, Field> fields)
+                {
+                    source = fields["source"].GetLong();
+                    sequence = fields["sequence"].GetLong();
+                    gridName = fields["gridName"].GetString();
+                    supportedCalls = fields["supportedCalls"].GetStringList();
+                }
+
+                public override void SaveToFields()
+                {
+                    fields["source"] = new Field(source);
+                    fields["sequence"] = new Field(sequence);
+                    fields["gridName"] = new Field(gridName);
+                    fields["supportedCalls"] = new Field(supportedCalls);
+                }
+
+                internal bool IsAlive()
+                {
+                    return ProgramTimeSource.Time - localTimestamp < DOWN_TIMEOUT;
+                }
+
+                internal bool ShouldRemove()
+                {
+                    return ProgramTimeSource.Time - localTimestamp > REMOVE_TIMEOUT;
+                }
+
+                public string ToString()
+                {
+                    return gridName;
+                }
+            }
+
+            public delegate void ParticipantsListener(Participant participant, bool alive);
+
+            private Dictionary<long, Participant> participants = new Dictionary<long, Participant>();
+            private List<ParticipantsListener> participantsListeners = new List<ParticipantsListener>();
+            private List<string> callsSupported = new List<string>();
+
+            public int seq = 0;
+
+            public Participant Me { get; internal set; }
+
+            public void AddListener(ParticipantsListener listener)
+            {
+                foreach (var participant in participants.Values)
+                {
+                    listener.Invoke(participant, participant.IsAlive());
+                }
+                participantsListeners.Add(listener);
+            }
+
+            public void RemoveListener(ParticipantsListener listener)
+            {
+                participantsListeners.Remove(listener);
+            }
+
+            public List<Participant> getParticipants()
+            {
+                return new List<Participant>(participants.Values).FindAll(p => p.IsAlive());
+            }
+
+            internal Participant NextMe()
+            {
+                return new Participant
+                {
+                    source = ProgramInstance.Me.EntityId,
+                    gridName = ProgramInstance.Me.CubeGrid.DisplayName,
+                    supportedCalls = callsSupported,
+                    sequence = seq++
+                };
+            }
+
+            public IEnumerable<WaitCondition> PingerLoop()
+            {
+                Participant participant = NextMe();
+                Me = participant;
+
+                KeepAlive(participant);
+                ProgramInstance.IGC.SendBroadcastMessage(PINGS_TAG, participant.Serialize());
+
+                yield return Delay(500)
+                    .WithStatus("ping out");
+
+                List<long> toRemove = new List<long>();
+                foreach (long id in participants.Keys)
+                {
+                    if (!participants[id].IsAlive())
+                    {
+                        if (participant.aliveStatus)
+                        {
+                            foreach (var listener in participantsListeners)
+                            {
+                                listener.Invoke(participants[id], false);
+                            }
+                        }
+                        participant.aliveStatus = false;
+                    }
+
+                    if (participants[id].ShouldRemove())
+                    {
+                        toRemove.Add(id);
+                    }
+                }
+
+                foreach (long id in toRemove)
+                {
+                    participants.Remove(id);
+                }
+            }
+
+            public IEnumerable<WaitCondition> PingReceiverLoop()
+            {
+                WaitCondition wc = MessagesReceived(PINGS_TAG)
+                    .WithStatus("ping in " + participants.Count);
+
+                yield return wc;
+
+                foreach (var msg in wc.GetMessages(PINGS_TAG))
+                {
+                    string data = msg.As<string>();
+                    var participant = Serializer.DeSerialize<Participant>(data);
+                    KeepAlive(participant);
+                }
+            }
+
+            private bool KeepAlive(Participant participant)
+            {
+                long id = participant.source;
+                bool wasAlive = false;
+                long lastSeq = -1;
+                if (participants.ContainsKey(id))
+                {
+                    wasAlive = participants[id].aliveStatus;
+                    lastSeq = participants[id].sequence;
+                    participants.Remove(id);
+                }
+
+                participants[id] = participant;
+
+                if (!wasAlive)
+                {
+                    foreach (var listener in participantsListeners)
+                    {
+                        listener.Invoke(participant, true);
+                    }
+                }
+
+                participant.aliveStatus = true;
+
+                return participant.sequence > lastSeq;
+            }
+
+            public void Start(params API.Common.EntryPoint[] supportedCalls)
+            {
+                foreach (var call in supportedCalls)
+                {
+                    callsSupported.Add(call.RequestTag);
+                }
+                Me = NextMe();
+                RoutineRunner.Start(PingerLoop(), 100, true);
+                RoutineRunner.Start(PingReceiverLoop(), 0, true);
+            }
+        }
+
+        public partial class API
+        {
+            public partial class Common
+            {
+
+                public interface Request
+                {
+                    long Cookie { get; set; }
+                    List<long> Recepients { get; set; }
+                    string ResponseTag { get; set; }
+                }
+
+                public interface Response
+                {
+                    long Cookie { get; set; }
+                    long Source { get; set; }
+                }
+
+                public interface EntryPoint
+                {
+                    string RequestTag { get; }
+                }
+
+                public class APICall<I, O> : EntryPoint where I : Request where O : Response
+                {
+                    public string RequestTag { get; set; }
+                    public string ResponseTagPrefix { get; set; }
+
+                    public List<Mesh.Participant> FilterParticipants(List<Mesh.Participant> participants)
+                    {
+                        return participants.FindAll(p => p.supportedCalls.Contains(RequestTag));
+                    }
+                }
+
+                public static IEnumerable<WaitCondition> Rpc<I, O>(
+                    API.Common.APICall<I, O> call,
+                    List<Mesh.Participant> participants,
+                    I request,
+                    Dictionary<Mesh.Participant, O> responses
+                    ) where I : Serializable, Request where O : Serializable, Response, new()
+                {
+                    if (participants.Count == 0)
+                    {
+                        yield break;
+                    }
+
+                    string responseTag = call.ResponseTagPrefix + ":" + ProgramInstance.Me.EntityId;
+                    request.Recepients = participants.ConvertAll(p => p.source);
+                    request.ResponseTag = responseTag;
+                    request.Cookie = ProgramRandom.Next();
+
+                    ProgramInstance.IGC.SendBroadcastMessage(
+                        call.RequestTag,
+                        request.Serialize()
+                    );
+
+                    responses.Clear();
+
+                    ExitFlag exitFlag = new ExitFlag();
+                    while (!exitFlag.ShouldExit)
+                    {
+                        WaitCondition wc = MessagesReceived(responseTag)
+                            .WithDelay(3000)
+                            .WithExitFlagProvider(ef => exitFlag = ef)
+                            .WithStatus("rpc " + call.RequestTag);
+
+                        yield return wc;
+
+                        foreach (var msg in wc.GetMessages(responseTag))
+                        {
+                            O response = Serializer.DeSerialize<O>(msg.As<string>());
+                            Mesh.Participant p = participants.Find(f => f.source == response.Source);
+                            if (p != null)
+                            {
+                                ProgramInstance.Echo(p.ToString());
+                                responses.Add(p, response);
+                                ProgramInstance.Echo(responses.Count + " " + participants.Count);
+                                if (responses.Count == participants.Count)
+                                {
+                                    yield break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                public static IEnumerable<WaitCondition> Rpc<I, O>(
+                    API.Common.APICall<I, O> call,
+                    Mesh.Participant participant,
+                    I request,
+                    Action<O> responseAction
+                    ) where I : Serializable, Request where O : Serializable, Response, new()
+                {
+                    List<Mesh.Participant> list = new List<Mesh.Participant>();
+                    list.Add(participant);
+                    Dictionary<Mesh.Participant, O> responses = new Dictionary<Mesh.Participant, O>();
+                    foreach (var wc in Rpc(call, list, request, responses))
+                    {
+                        yield return wc;
+                    }
+                    responseAction(responses[participant]);
+                    yield break;
+                }
+
+                public static IEnumerable<WaitCondition> Rpc<I, O>(
+                    API.Common.APICall<I, O> call,
+                    I request,
+                    Dictionary<Mesh.Participant, O> responses
+                    ) where I : Serializable, Request where O : Serializable, Response, new()
+                {
+                    List<Mesh.Participant> participants = call.FilterParticipants(MeshNetwork.getParticipants());
+                    foreach (var wc in Rpc(call, participants, request, responses))
+                    {
+                        yield return wc;
+                    }
+                }
+            }
         }
     }
 }
+
+
+/*
+ * Credits:
+ *  - coroutines:
+ *  - missile guidance:
+ *  - graphics:
+ *  - cubeviewer: 
+ *  - object serialization: https://steamcommunity.com/sharedfiles/filedetails/?id=1212934715
+ */
